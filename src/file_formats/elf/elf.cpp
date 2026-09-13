@@ -1,0 +1,222 @@
+/*
+* Copyright (c) 2026 WengShi
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
+#include <elf.h>
+#include <vfs.h>
+#include <vmm.h>
+#include <heap.h>
+#include <terminal.h>
+#include <string.h>
+#include <printf.h>
+
+namespace Elf {
+    namespace {
+#pragma pack(push, 1)
+        struct Elf64_Ehdr {
+            uint8_t e_ident[16];
+            uint16_t e_type;
+            uint16_t e_machine;
+            uint32_t e_version;
+            uint64_t e_entry;
+            uint64_t e_phoff;
+            uint64_t e_shoff;
+            uint32_t e_flags;
+            uint16_t e_ehsize;
+            uint16_t e_phentsize;
+            uint16_t e_phnum;
+            uint16_t e_shentsize;
+            uint16_t e_shnum;
+            uint16_t e_shstrndx;
+        };
+
+        struct Elf64_Phdr {
+            uint32_t p_type;
+            uint32_t p_flags;
+            uint64_t p_offset;
+            uint64_t p_vaddr;
+            uint64_t p_paddr;
+            uint64_t p_filesz;
+            uint64_t p_memsz;
+            uint64_t p_align;
+        };
+#pragma pack(pop)
+
+        constexpr uint8_t ELFMAG0 = 0x7F;
+        constexpr uint8_t ELFMAG1 = 'E';
+        constexpr uint8_t ELFMAG2 = 'L';
+        constexpr uint8_t ELFMAG3 = 'F';
+        constexpr uint8_t ELFCLASS64 = 2;
+        constexpr uint8_t ELFDATA2LSB = 1;
+        constexpr uint16_t ET_EXEC = 2;
+        constexpr uint16_t EM_X86_64 = 62;
+
+        constexpr uint32_t PT_LOAD = 1;
+
+        constexpr uint32_t PF_X = 1;
+        constexpr uint32_t PF_W = 2;
+        constexpr uint32_t PF_R = 4;
+
+        constexpr uint64_t USER_STACK_TOP = 0x7FFFFFFFF000ull;
+        constexpr uint64_t USER_STACK_SIZE = 4 * VMM::PAGE_SIZE;
+
+        bool readFully(int fd, void *buf, size_t count) {
+            uint8_t *p = static_cast<uint8_t *>(buf);
+            size_t total = 0;
+            while (total < count) {
+                int64_t n = VFS::read(fd, p + total, count - total);
+                if (n <= 0) return false;
+                total += static_cast<size_t>(n);
+            }
+            return true;
+        }
+
+        bool readAt(const int fd, const uint64_t offset, void *buf, const size_t count) {
+            (void) fd;
+            (void) offset;
+            (void) buf;
+            (void) count;
+            return false;
+        }
+
+        constexpr int MAX_ARGS = 16;
+
+        uint64_t setupArgs(uint64_t stack_top, int argc, char **argv, uint64_t *out_argv_user_ptr) {
+            if (argc > MAX_ARGS) argc = MAX_ARGS;
+
+            uint64_t sp = stack_top;
+            uint64_t str_addrs[MAX_ARGS];
+
+            for (int i = argc - 1; i >= 0; --i) {
+                size_t len = strlen(argv[i]) + 1;
+                sp -= len;
+                memcpy(reinterpret_cast<void *>(sp), argv[i], len);
+                str_addrs[i] = sp;
+            }
+
+            sp &= ~0x7ull;
+
+            sp -= static_cast<uint64_t>(argc + 1) * sizeof(uint64_t);
+            auto *argv_array = reinterpret_cast<uint64_t *>(sp);
+            for (int i = 0; i < argc; ++i) argv_array[i] = str_addrs[i];
+            argv_array[argc] = 0;
+
+            sp &= ~0xFull;
+
+            *out_argv_user_ptr = reinterpret_cast<uint64_t>(argv_array);
+            return sp;
+        }
+    }
+
+    uint64_t load(const char *path, int argc, char **argv, uint64_t *out_stack_top, uint64_t *out_argv_user_ptr) {
+        int fd = VFS::open(path);
+        if (fd == VFS::INVALID_FD) {
+            g_terminal.write("elf: cannot open ");
+            g_terminal.write(path);
+            g_terminal.write("\n");
+            return 0;
+        }
+
+        Elf64_Ehdr header;
+        if (!readFully(fd, &header, sizeof(header))) {
+            g_terminal.write("elf: failed to read header\n");
+            VFS::close(fd);
+            return 0;
+        }
+
+        if (header.e_ident[0] != ELFMAG0 || header.e_ident[1] != ELFMAG1 ||
+            header.e_ident[2] != ELFMAG2 || header.e_ident[3] != ELFMAG3) {
+            g_terminal.write("elf: bad magic\n");
+            VFS::close(fd);
+            return 0;
+        }
+        if (header.e_ident[4] != ELFCLASS64 || header.e_ident[5] != ELFDATA2LSB) {
+            g_terminal.write("elf: unsupported class/endianness\n");
+            VFS::close(fd);
+            return 0;
+        }
+        if (header.e_machine != EM_X86_64) {
+            g_terminal.write("elf: wrong architecture\n");
+            VFS::close(fd);
+            return 0;
+        }
+        if (header.e_type != ET_EXEC) {
+            g_terminal.write("elf: not a static executable\n");
+            VFS::close(fd);
+            return 0;
+        }
+        if (header.e_phnum == 0 || header.e_phentsize != sizeof(Elf64_Phdr)) {
+            g_terminal.write("elf: no/invalid program headers\n");
+            VFS::close(fd);
+            return 0;
+        }
+
+        VFS::seek(fd, static_cast<int64_t>(header.e_phoff), VFS::SeekMode::Set);
+
+        size_t ph_table_size = static_cast<size_t>(header.e_phnum) * sizeof(Elf64_Phdr);
+        auto *phdrs = static_cast<Elf64_Phdr *>(Heap::kmalloc(ph_table_size));
+        if (!phdrs) {
+            VFS::close(fd);
+            return 0;
+        }
+        if (!readFully(fd, phdrs, ph_table_size)) {
+            g_terminal.write("elf: failed to read program headers\n");
+            Heap::kfree(phdrs);
+            VFS::close(fd);
+            return 0;
+        }
+
+        for (uint16_t i = 0; i < header.e_phnum; ++i) {
+            Elf64_Phdr &ph = phdrs[i];
+            if (ph.p_type != PT_LOAD) continue;
+
+            uint64_t seg_start = ph.p_vaddr & ~(VMM::PAGE_SIZE - 1);
+            uint64_t seg_end = (ph.p_vaddr + ph.p_memsz + VMM::PAGE_SIZE - 1) & ~(VMM::PAGE_SIZE - 1);
+
+            uint64_t flags = VMM::PAGE_USER;
+            if (ph.p_flags & PF_W) flags |= VMM::PAGE_WRITABLE;
+
+            for (uint64_t addr = seg_start; addr < seg_end; addr += VMM::PAGE_SIZE) {
+                VMM::allocAndMapPage(addr, flags);
+            }
+
+            memset(reinterpret_cast<void *>(seg_start), 0, seg_end - seg_start);
+
+            if (ph.p_filesz > 0) {
+                VFS::seek(fd, static_cast<int64_t>(ph.p_offset), VFS::SeekMode::Set);
+                if (!readFully(fd, reinterpret_cast<void *>(ph.p_vaddr), ph.p_filesz)) {
+                    g_terminal.write("elf: failed to load segment data\n");
+                    Heap::kfree(phdrs);
+                    VFS::close(fd);
+                    return 0;
+                }
+            }
+        }
+
+        Heap::kfree(phdrs);
+        VFS::close(fd);
+
+        uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+        for (uint64_t addr = stack_bottom; addr < USER_STACK_TOP; addr += VMM::PAGE_SIZE) {
+            VMM::allocAndMapPage(addr, VMM::PAGE_WRITABLE | VMM::PAGE_USER);
+        }
+
+        uint64_t argv_user_ptr = 0;
+        uint64_t final_stack_top = setupArgs(USER_STACK_TOP, argc, argv, &argv_user_ptr);
+
+        if (out_stack_top) *out_stack_top = final_stack_top;
+        if (out_argv_user_ptr) *out_argv_user_ptr = argv_user_ptr;
+
+        return header.e_entry;
+    }
+}
