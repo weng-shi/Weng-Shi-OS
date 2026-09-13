@@ -55,6 +55,11 @@ extern "C" uint8_t kernel_physical_end[];
 namespace {
   uint64_t g_highest_address = 0;
 
+  constexpr int MAX_MMAP_REGIONS = 64;
+  struct StoredRegion { uint64_t base; uint64_t length; };
+  StoredRegion g_available_regions[MAX_MMAP_REGIONS];
+  int g_available_region_count = 0;
+
   void findHighestAddress(const Multiboot::MmapEntry &entry, void *) {
     if (entry.type == Multiboot::MEMORY_AVAILABLE) {
       uint64_t region_end = entry.base_addr + entry.length;
@@ -64,9 +69,12 @@ namespace {
     }
   }
 
-  void freeAvailableRegions(const Multiboot::MmapEntry &entry, void *) {
-    if (entry.type == Multiboot::MEMORY_AVAILABLE) {
-      g_pmm.markRegionFree(entry.base_addr, entry.length);
+  void collectAvailableRegion(const Multiboot::MmapEntry &entry, void *) {
+    if (entry.type == Multiboot::MEMORY_AVAILABLE &&
+        g_available_region_count < MAX_MMAP_REGIONS) {
+      g_available_regions[g_available_region_count].base = entry.base_addr;
+      g_available_regions[g_available_region_count].length = entry.length;
+      ++g_available_region_count;
     }
   }
 
@@ -118,6 +126,11 @@ extern "C" [[noreturn]] void kernel_main(uint32_t multiboot_info_ptr) {
   Serial::writeHex(g_highest_address);
   Serial::write("\n");
 
+  Multiboot::parseMemoryMap(multiboot_info_ptr, collectAvailableRegion);
+  Serial::write("CP10b: collected ");
+  Serial::writeDec(g_available_region_count);
+  Serial::write(" available regions\n");
+
   uint64_t kernel_end_addr = reinterpret_cast<uint64_t>(kernel_physical_end);
   uint64_t bitmap_addr = (kernel_end_addr + 0xFFF) & ~0xFFFull;
   uint8_t* bitmap_ptr = reinterpret_cast<uint8_t*>(bitmap_addr);
@@ -128,7 +141,9 @@ extern "C" [[noreturn]] void kernel_main(uint32_t multiboot_info_ptr) {
   g_pmm.init(g_highest_address, bitmap_ptr);
   Serial::write("CP12: pmm init done\n");
 
-  Multiboot::parseMemoryMap(multiboot_info_ptr, freeAvailableRegions);
+  for (int i = 0; i < g_available_region_count; ++i) {
+    g_pmm.markRegionFree(g_available_regions[i].base, g_available_regions[i].length);
+  }
   Serial::write("CP13: free regions done\n");
 
   uint64_t bitmap_size = PhysicalMemoryManager::bitmapSizeFor(g_highest_address);
